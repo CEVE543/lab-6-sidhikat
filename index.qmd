@@ -119,3 +119,279 @@ Pkg.activate(lab_dir)
 # Pkg.instantiate() # uncomment this the first time you run the lab to install packages, then comment it back
 ```
 
+Work through the Getting Started with YAXArrays.jl
+```{julia}
+using YAXArrays
+using YAXArrays: YAXArrays as YAX
+
+a = YAXArray(rand(2,3))
+
+# axes or dimensions with name and tick values
+axlist = (
+    YAX.time(range(1, 20, length=20)),
+    lon(range(1, 10, length=10)),
+    lat(range(1, 5, length=15)),
+    Variables(["temperature", "precipitation"])
+)
+
+# the actual data matching the dimensions defined in axlist
+data = rand(20, 10, 15, 2)
+
+# metadata about the array
+props = Dict(
+    "origin" => "YAXArrays.jl example",
+    "x" => "longitude",
+    "y" => "latitude",
+);
+
+a2 = YAXArray(axlist, data, props)
+
+a2[Variables=At("temperature"), time=1].data
+```
+
+
+A lot of the functionality of YAXArrays.jl comes from from DimensionalData.jl. Read through the Dimensions, Selectors, and other sections of the DimensionalData documentation under “Getting Started”
+
+Notes: 
+- dimension can be used as wrappers for any object types
+- val() to get value 
+-  At(x) selector gets the index or indices exactly matching the passed in values, within ranges, or within a tolerance (atol param)!
+- can select values from B with selectors from A; if not aligned, can use Near insead of At 
+
+
+
+
+```{julia}
+using DimensionalData
+using YAXArrays
+using NetCDF
+using Downloads: download
+using IntervalSets
+
+if !isfile("example.nc")
+  path = download("https://archive.unidata.ucar.edu/software/netcdf/examples/tos_O1_2001-2002.nc", "example.nc")
+end
+
+ds = open_dataset("example.nc")
+
+tos = ds.tos
+#positional indexing
+tos[lon = 1, lat = 1]
+#named indexing
+tos[lon = At(1), lat = At(-79.5)]
+
+#ranges
+tos[lon = 1:10, lat = 1:10] #positional
+tos[lon = At(1.0:2:19), lat = At(-79.5:1:-70.5)] #named
+#tolerance
+tos[lon = At(1:10; atol = 1)]
+
+#closed interval, all points included
+tos[lon = 90 .. 180] 
+tos[lon = ClosedInterval(90, 180)]
+
+#open on both ends
+tos[lon = OpenInterval(90, 180)]
+
+#interval is open on the left (excludes 90) and closed on the right (includes 180).
+tos[lon =Interval{:open,:closed}(90,180)]
+
+# Get values, .e.g., axis tick labels, of a dimension that can be used for subseting:
+collect(tos.lat)
+tos.lon.val
+```
+
+Work through the Plotting Maps tutorial
+```{julia}
+using Zarr, YAXArrays, Dates
+using DimensionalData
+using GLMakie, GeoMakie
+using GLMakie.GeometryBasics
+
+store ="gs://cmip6/CMIP6/ScenarioMIP/DKRZ/MPI-ESM1-2-HR/ssp585/r1i1p1f1/3hr/tas/gn/v20190710/"
+g = open_dataset(zopen(store, consolidated=true))
+```
+
+```{julia}
+c = g["tas"]
+ct1_slice = c[time = Near(Date("2015-01-01"))]
+lon_d = lookup(ct1_slice, :lon)
+lat_d = lookup(ct1_slice, :lat)
+data_d = ct1_slice.data[:,:]
+```
+
+Heatmap plot
+```{julia}
+GLMakie.activate!()
+
+fig, ax, plt = heatmap(ct1_slice; colormap = :seaborn_icefire_gradient,
+    axis = (; aspect=DataAspect()),
+    figure = (; size = (800,600), fontsize=24))
+fig
+
+```
+Wintri projection
+```{julia}
+δlon = (lon_d[2] - lon_d[1])/2
+nlon = lon_d .- 180 .+ δlon
+ndata = circshift(data_d, (192,1))
+
+fig = Figure(;size=(800,600))
+ax = GeoAxis(fig[1,1])
+surface!(ax, nlon, lat_d, ndata; colormap = :seaborn_icefire_gradient, shading=false)
+cl=lines!(ax, GeoMakie.coastlines(), color = :white, linewidth=0.85)
+translate!(cl, 0, 0, 1000)
+fig
+```
+
+Select a single rectangular region. Compute the average tas over that region and plot the time series of tas for that region.
+
+```{julia}
+
+# 1. Define remote store and the local file path for our *region*
+remote_store_url = "gs://cmip6/CMIP6/ScenarioMIP/DKRZ/MPI-ESM1-2-HR/ssp585/r1i1p1f1/3hr/tas/gn/v20190710/"
+local_nc_path = "tas_region.nc" # We will save our slice here as NetCDF but could use a different back end
+
+# 2. Check if the local file exists. If not, create it.
+if !isfile(local_nc_path)
+    println("Local file not found. Downloading region from GCS...")
+    
+    tas = g["tas"]
+
+    # Define the regional slice 
+    region_remote = tas[lon = 100 .. 101, lat = 88 .. 88.5]
+
+    # This line triggers the download and saves the result
+    println("Saving region to: $local_nc_path")
+    savecube(region_remote, local_nc_path, driver=:netcdf)
+    
+    println("Local region file created.")
+else
+    println("Local file $local_nc_path already exists. Skipping download.")
+end
+
+# 3. Load the regional data for analysis
+println("Loading regional data from: $local_nc_path")
+regional_dataset = open_dataset(local_nc_path)
+regional_data = regional_dataset["tas"]
+
+println("Regional data loaded. Shape: ", size(regional_data))
+```
+
+```{julia}
+using Statistics
+
+avg_tas = mean(skipmissing(regional_data))
+
+
+println("Average TAS for the region: $avg_tas")
+
+# Compute spatial average for each time step to create a time series
+# First, let's check how many time steps we're dealing with
+n_times = length(regional_data.time)
+println("Number of time steps: $n_times")
+
+#skipping time steps for computation
+time_indices = 1:50:n_times
+time_series = [mean(skipmissing(regional_data[time=t].data)) 
+                for t in time_indices]
+time_values = regional_data.time.val[time_indices]
+
+
+println("Time series computed with $(length(time_series)) time steps")
+
+# Convert from Kelvin to Celsius
+time_series_celsius = time_series .- 273.15
+
+# time_values was already set above based on whether we sampled or not
+println("Time series length: ", length(time_series_celsius))
+println("Temperature range (°C): ", extrema(time_series_celsius))
+
+
+```
+
+```{julia}
+using CairoMakie
+CairoMakie.activate!()
+
+# Plot the time series
+fig = Figure(; size = (800,600))
+ax = Axis(fig[1, 1], 
+    xlabel = "Time", 
+    ylabel = "Temperature (°C)",
+    title = "Average Temperature Time Series over rectangular region")
+
+# Plot the time series
+lines!(ax, time_values, time_series_celsius, color = :blue, linewidth = 1.5)
+
+fig
+```
+
+Find the hottest and coldest 3-hourly periods and plot global temperature distributions
+```{julia}
+# Find the indices of the hottest and coldest periods
+hottest_idx = argmax(time_series_celsius)
+coldest_idx = argmin(time_series_celsius)
+
+println("Hottest period: $(time_values[hottest_idx]) with temperature $(time_series_celsius[hottest_idx])°C")
+println("Coldest period: $(time_values[coldest_idx]) with temperature $(time_series_celsius[coldest_idx])°C")
+
+# Get the global temperature data for these two time periods
+hottest_global = c[time = hottest_idx]
+coldest_global = c[time = coldest_idx]
+
+```
+
+plot using wintri projection
+```{julia}
+using CairoMakie, GeoMakie
+CairoMakie.activate!()
+
+# Prepare data for plotting 
+lon_global = lookup(hottest_global, :lon)
+lat_global = lookup(hottest_global, :lat)
+
+# Shift longitude from 0-360 to -180-180 for better map visualization
+δlon = (lon_global[2] - lon_global[1])/2
+nlon = lon_global .- 180 .+ δlon
+
+# Get the temperature data and shift it correspondingly
+hottest_data = circshift(hottest_global.data[:,:], (192,1))
+coldest_data = circshift(coldest_global.data[:,:], (192,1))
+
+# Convert from Kelvin to Celsius
+hottest_data_celsius = hottest_data .- 273.15
+coldest_data_celsius = coldest_data .- 273.15
+
+
+fig = Figure(; size = (800,600))
+
+# Plot the hottest period
+ax1 = GeoAxis(fig[1,1], title = "Hottest Period: $(time_values[hottest_idx])")
+surface!(ax1, nlon, lat_global, hottest_data_celsius; 
+         colormap = :seaborn_icefire_gradient, shading=false,
+         colorrange = extrema(hottest_data_celsius))
+cl1 = lines!(ax1, GeoMakie.coastlines(), color = :white, linewidth=0.85)
+translate!(cl1, 0, 0, 1000)
+fig
+```
+
+```{julia}
+
+fig = Figure(; size = (800,600))
+# Plot the coldest period  
+ax2 = GeoAxis(fig[1,1], title = "Coldest Period: $(time_values[coldest_idx])")
+surface!(ax2, nlon, lat_global, coldest_data_celsius; 
+         colormap = :seaborn_icefire_gradient, shading=false,
+         colorrange = extrema(coldest_data_celsius))
+cl2 = lines!(ax2, GeoMakie.coastlines(), color = :white, linewidth=0.85)
+translate!(cl2, 0, 0, 1000)
+
+
+fig
+```
+
+
+
+
+
